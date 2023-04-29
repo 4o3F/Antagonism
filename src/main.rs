@@ -178,7 +178,7 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
     );
 
     // Remove the first byte that indicates the spake2 identity
-    msg.pop();
+    msg.remove(0);
 
     let mut packet = PairingPacketHeader {
         packet_version: CURRENT_KEY_HEADER_VERSION,
