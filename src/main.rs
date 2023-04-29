@@ -171,11 +171,14 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
         pass_buffer.write_bytes(&key_material);
     }
 
-    let (spake25519, msg) = Spake2::<Ed25519Group>::start_a(
+    let (spake25519, mut msg) = Spake2::<Ed25519Group>::start_a(
         &Password::new(pass_buffer.into_vec()),
         &Identity::new(CLIENT_NAME.as_ref()),
         &Identity::new(SERVER_NAME.as_ref()),
     );
+
+    // Remove the first byte that indicates the spake2 identity
+    msg.pop();
 
     let mut packet = PairingPacketHeader {
         packet_version: CURRENT_KEY_HEADER_VERSION,
