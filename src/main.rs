@@ -318,8 +318,7 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
 
         let mut secret_key = [0u8; HKDF_KEY_LENGTH];
         let hkdf = hkdf::Hkdf::<Sha256>::new(None, key_material.as_slice());
-        let info = "adb pairing_auth aes-128-gcm key".as_bytes();
-        hkdf.expand(info, &mut secret_key).expect("Error in generating hkdf bytes");
+        hkdf.expand(INFO.as_ref(), &mut secret_key).expect("Error in generating hkdf bytes");
         let aes_key = aes_gcm::Key::<Aes128Gcm>::from_slice(&secret_key);
         let mut cipher = Aes128Gcm::new(&aes_key);
 
@@ -355,9 +354,9 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
 
 #[tokio::main]
 async fn main() {
-    let ip = "192.168.31.150";
-    let port = 40685;
-    let password = "077906";
+    let ip = "192.168.4.115";
+    let port = 41497;
+    let password = "981859";
 
 //    adb_pairing(ip, port, password);
 
