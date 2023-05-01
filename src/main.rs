@@ -160,6 +160,7 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
     let connector = TlsConnector::from(Arc::new(config));
     let mut stream = connector.connect(ServerName::try_from(ip).unwrap(), stream).await.expect("Connection error");
 
+    // Export the paring auth ctx
     let mut pass_buffer = ByteBuffer::new();
     {
         let client_connection = stream.get_mut().1;
@@ -333,13 +334,14 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
 
 
         // Write out header
+        // If error will get "Invalid PairingPacketHeader."
         let mut buffer = ByteBuffer::new();
         buffer.resize(PAIRING_PACKET_HEADER_SIZE as usize);
         buffer.set_endian(bytebuffer::Endian::BigEndian);
         buffer.write_bytes(&[packet.packet_version, packet.packet_type]);
         buffer.write_bytes(&packet.packet_payload_size.to_be_bytes());
         stream.write(buffer.as_bytes()).await?;
-        stream.write(msg.as_slice()).await?;
+        stream.write(encrypted_buffer.as_slice()).await?;
     }
 
     Ok(())
