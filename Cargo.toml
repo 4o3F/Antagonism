@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+aes-gcm = "0.10.1"
 aes-gcm-siv = "0.11.1"
 base64 = "0.21.0"
 bytebuffer = "2.1.1"
@@ -19,7 +20,7 @@ num-traits = { version = "0.2.15", default-features = false, features = ["libm"]
 picky = "6.3.0"
 rand = "0.8.5"
 rcgen = "0.10.0"
-rsa = "0.8.2"
+rsa = "0.9.0"
 sha2 = "0.10.6"
 spake2 = "0.3.1"
 tokio = { version = "1.27.0", features = ["full"] }

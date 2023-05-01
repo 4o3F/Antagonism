@@ -1,10 +1,13 @@
 extern crate core;
+
 use std::ops::{Index, Sub};
 use std::sync::Arc;
 
-use aes_gcm_siv::{Aes128GcmSiv, Aes256GcmSiv, KeyInit, Nonce};
-use aes_gcm_siv::aead::AeadMut;
-use aes_gcm_siv::aead::generic_array::GenericArray;
+use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
+use aes_gcm::aead::AeadMut;
+use aes_gcm::aead::generic_array::GenericArray;
+use aes_gcm::aes::{Aes128Dec, Aes128Enc};
+use aes_gcm::aes::cipher::BlockEncrypt;
 use base64::Engine;
 use bytebuffer::{ByteBuffer, Endian};
 use futures::executor::block_on;
@@ -14,8 +17,9 @@ use num_bigint::{BigInt, BigUint, Sign, ToBigInt, ToBigUint};
 use num_modular::{ModularCoreOps, ModularPow, ModularUnaryOps};
 use num_traits::{One, ToPrimitive, Zero};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SignatureAlgorithm};
-use rsa::{PublicKeyParts, RsaPrivateKey, RsaPublicKey};
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey};
+use rsa::traits::PublicKeyParts;
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -140,7 +144,7 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
         public_key = RsaPublicKey::from_public_key_pem(public_key_pem.as_str()).expect("Wrong public key");
     }
 
-    let public_key = rsa::RsaPublicKey::from_public_key_pem();
+    // let public_key = rsa::RsaPublicKey::from_public_key_pem();
 
     //println!("Modulus: {}", public_key.n());
     // Setup TCP TLS connection
@@ -237,9 +241,6 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
     stream.read_exact(their_msg.as_mut_slice()).await?;
     their_msg.insert(0, 0x42);
     let key_material = spake25519.finish(their_msg.as_mut_slice()).expect("Spake2 decryption error!");
-    let mut secret_key = [0u8; HKDF_KEY_LENGTH];
-    let hk = hkdf::Hkdf::<Sha256>::new(None, key_material.as_slice());
-    hk.expand(&[], &mut secret_key).expect("Error in generating hkdf bytes");
 
     // Start exchanging peer info
     let peer_info: PeerInfo;
@@ -308,14 +309,19 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
     let mut encrypt_iv = 0i64;
     let mut decrypt_iv = 0i64;
     {
-        let mut buffer = ByteBuffer::new();
-        buffer.resize(MAX_PEER_INFO_SIZE);
-        buffer.set_endian(Endian::BigEndian);
-        buffer.write_u8(peer_info.peer_type);
-        buffer.write_bytes(peer_info.peer_data.as_slice());
-        //aes_gcm_siv::Key::new_from_slice(&secret_key).expect("GCM Key error");
-        let aes_key = aes_gcm_siv::Key::<Aes128GcmSiv>::from_slice(&secret_key);
-        let mut cipher = Aes128GcmSiv::new(&aes_key);
+        let mut peerInfoBuffer = ByteBuffer::new();
+        peerInfoBuffer.resize(MAX_PEER_INFO_SIZE);
+        peerInfoBuffer.set_endian(Endian::BigEndian);
+        peerInfoBuffer.write_u8(peer_info.peer_type);
+        peerInfoBuffer.write_bytes(peer_info.peer_data.as_slice());
+        // aes_gcm_siv::Key::new_from_slice(&secret_key).expect("GCM Key error");
+
+        let mut secret_key = [0u8; HKDF_KEY_LENGTH];
+        let hkdf = hkdf::Hkdf::<Sha256>::new(None, key_material.as_slice());
+        let info = "adb pairing_auth aes-128-gcm key".as_bytes();
+        hkdf.expand(info, &mut secret_key).expect("Error in generating hkdf bytes");
+        let aes_key = aes_gcm::Key::<Aes128Gcm>::from_slice(&secret_key);
+        let mut cipher = Aes128Gcm::new(&aes_key);
 
         let mut iv_buffer = ByteBuffer::new();
         iv_buffer.resize(GCM_IV_LENGTH);
@@ -324,7 +330,7 @@ async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn 
         encrypt_iv += 1;
 
         let nonce = Nonce::from_slice(iv_buffer.as_bytes());
-        let encrypted_buffer = cipher.encrypt(nonce, buffer.as_bytes()).expect("Encrypt peer info buffer error!");
+        let encrypted_buffer = cipher.encrypt(nonce, peerInfoBuffer.as_bytes()).expect("Encrypt peer info buffer error!");
 
         packet = PairingPacketHeader {
             packet_version: CURRENT_KEY_HEADER_VERSION,
