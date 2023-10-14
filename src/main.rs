@@ -1,369 +1,452 @@
 extern crate core;
 
-use std::ops::{Index, Sub};
-use std::sync::Arc;
-
-use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
-use aes_gcm::aead::AeadMut;
-use aes_gcm::aead::generic_array::GenericArray;
-use aes_gcm::aes::{Aes128Dec, Aes128Enc};
-use aes_gcm::aes::cipher::BlockEncrypt;
-use base64::Engine;
-use bytebuffer::{ByteBuffer, Endian};
-use futures::executor::block_on;
-use lazy_static::lazy_static;
-use math::set::traits::Finite;
-use num_bigint::{BigInt, BigUint, Sign, ToBigInt, ToBigUint};
-use num_modular::{ModularCoreOps, ModularPow, ModularUnaryOps};
-use num_traits::{One, ToPrimitive, Zero};
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SignatureAlgorithm};
-use rsa::{RsaPrivateKey, RsaPublicKey};
-use rsa::pkcs8::{DecodePublicKey, EncodePrivateKey};
-use rsa::traits::PublicKeyParts;
-use sha2::Sha256;
-use spake2::{Ed25519Group, Identity, Password, Spake2};
+use anyhow::{anyhow, Context};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_rustls::rustls::{Certificate, ClientConfig, PrivateKey, ServerName};
-use tokio_rustls::TlsConnector;
+use std::io::{BufRead, Read, Write};
 
-use crate::no_cert_verifier::NoVerifier;
+const EXPORTED_KEY_LABEL: &str = "adb-label\u{0}";
+const CLIENT_NAME: &str = "adb pair client\u{0}";
+const SERVER_NAME: &str = "adb pair server\u{0}";
+const MAX_PEER_INFO_SIZE: i32 = 1 << 13;
 
-mod utils;
-mod no_cert_verifier;
+const ANDROID_PUBKEY_MODULUS_SIZE: i32 = 2048 / 8;
+const ANDROID_PUBKEY_ENCODED_SIZE: i32 = 3 * 4 + 2 * ANDROID_PUBKEY_MODULUS_SIZE;
+const ANDROID_PUBKEY_MODULUS_SIZE_WORDS: i32 = ANDROID_PUBKEY_MODULUS_SIZE / 4;
 
-lazy_static! {
-    static ref CLIENT_NAME: Vec<u8> = utils::string_compat::get_bytes(String::from("adb pair client\u{0000}"));
-    static ref SERVER_NAME: Vec<u8> = utils::string_compat::get_bytes(String::from("adb pair server\u{0000}"));
-    static ref INFO: Vec<u8> = utils::string_compat::get_bytes(String::from("adb pairing_auth aes-128-gcm key"));
-    static ref EXPORTED_KEY_LABEL: Vec<u8> =  utils::string_compat::get_bytes(String::from("adb-label\u{0000}"));
-}
-const HKDF_KEY_LENGTH: usize = 128 / 8;
-const GCM_IV_LENGTH: usize = 12;
+fn generate_cert() -> anyhow::Result<(boring::x509::X509, boring::pkey::PKey<boring::pkey::Private>)> {
+    let rsa = boring::rsa::Rsa::generate(2048).context("failed to generate rsa keypair")?;
+    // put it into the pkey struct
+    let pkey = boring::pkey::PKey::from_rsa(rsa).context("failed to create pkey struct from rsa keypair")?;
 
-// Android Public Key
-const ANDROID_PUBKEY_MODULUS_SIZE: usize = 2048 / 8;
-const ANDROID_PUBKEY_ENCODED_SIZE: usize = 3 * 4 + 2 * ANDROID_PUBKEY_MODULUS_SIZE;
-const ANDROID_PUBKEY_MODULUS_SIZE_WORDS: usize = ANDROID_PUBKEY_MODULUS_SIZE / 4;
-const SIGNATURE_PADDING_AS_INT: [i32; 236] = [
-    0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
-    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
-    0x04, 0x14
-];
+    // make a new x509 certificate with the pkey we generated
+    let mut x509builder = boring::x509::X509::builder().context("failed to make x509 builder")?;
+    x509builder
+        .set_version(2)
+        .context("failed to set x509 version")?;
 
-lazy_static! {
-    static ref RSA_SHA_PKCS1_SIGNATURE_PADDING: Vec<u8> = {
-        let mut bytes = Vec::<u8>::with_capacity(SIGNATURE_PADDING_AS_INT.len());
-        for i in SIGNATURE_PADDING_AS_INT.iter() {
-            bytes.push(*i as u8);
-        }
-        bytes
+    // set the serial number to some big random positive integer
+    let mut serial = boring::bn::BigNum::new().context("failed to make new bignum")?;
+    serial
+        .rand(32, boring::bn::MsbOption::ONE, false)
+        .context("failed to generate random bignum")?;
+    let serial = serial
+        .to_asn1_integer()
+        .context("failed to get asn1 integer from bignum")?;
+    x509builder
+        .set_serial_number(&serial)
+        .context("failed to set x509 serial number")?;
+
+    // call fails without expiration dates
+    // I guess they are important anyway, but still
+    let not_before = boring::asn1::Asn1Time::days_from_now(0).context("failed to parse 'notBefore' timestamp")?;
+    let not_after = boring::asn1::Asn1Time::days_from_now(360)
+        .context("failed to parse 'notAfter' timestamp")?;
+    x509builder
+        .set_not_before(&not_before)
+        .context("failed to set x509 start date")?;
+    x509builder
+        .set_not_after(&not_after)
+        .context("failed to set x509 expiration date")?;
+
+    // add the issuer and subject name
+    // it's set to "/CN=LinuxTransport"
+    // if we want we can make that configurable later
+    let mut x509namebuilder = boring::x509::X509Name::builder().context("failed to get x509name builder")?;
+    x509namebuilder
+        .append_entry_by_text("CN", "LinuxTransport")
+        .context("failed to append /CN=LinuxTransport to x509name builder")?;
+    let x509name = x509namebuilder.build();
+    x509builder
+        .set_issuer_name(&x509name)
+        .context("failed to set x509 issuer name")?;
+    x509builder
+        .set_subject_name(&x509name)
+        .context("failed to set x509 subject name")?;
+
+    // set the public key
+    x509builder
+        .set_pubkey(&pkey)
+        .context("failed to set x509 pubkey")?;
+
+    // it also needs several extensions
+    // in the openssl configuration file, these are set when generating certs
+    //     basicConstraints=CA:true
+    //     subjectKeyIdentifier=hash
+    //     authorityKeyIdentifier=keyid:always,issuer
+    // that means these extensions get added to certs generated using the
+    // command line tool automatically. but since we are constructing it, we
+    // need to add them manually.
+    // we need to do them one at a time, and they need to be in this order
+    // let conf = boring::conf::Conf::new(boring::conf::ConfMethod::).context("failed to make new conf struct")?;
+    // it seems like everything depends on the basic constraints, so let's do
+    // that first.
+    let bc = boring::x509::extension::BasicConstraints::new()
+        .ca()
+        .build()
+        .context("failed to build BasicConstraints extension")?;
+    x509builder
+        .append_extension(bc)
+        .context("failed to append BasicConstraints extension")?;
+
+    // the akid depends on the skid. I guess it copies the skid when the cert is
+    // self-signed or something, I'm not really sure.
+    let skid = {
+        // we need to wrap these in a block because the builder gets borrowed away
+        // from us
+        let ext_con = x509builder.x509v3_context(None, None);
+        boring::x509::extension::SubjectKeyIdentifier::new()
+            .build(&ext_con)
+            .context("failed to build SubjectKeyIdentifier extention")?
     };
+    x509builder
+        .append_extension(skid)
+        .context("failed to append SubjectKeyIdentifier extention")?;
+
+    // now that the skid is added we can add the akid
+    let akid = {
+        let ext_con = x509builder.x509v3_context(None, None);
+        boring::x509::extension::AuthorityKeyIdentifier::new()
+            .keyid(true)
+            .issuer(false)
+            .build(&ext_con)
+            .context("failed to build AuthorityKeyIdentifier extention")?
+    };
+    x509builder
+        .append_extension(akid)
+        .context("failed to append AuthorityKeyIdentifier extention")?;
+
+    // self-sign the certificate
+    x509builder
+        .sign(&pkey, boring::hash::MessageDigest::sha256())
+        .context("failed to self-sign x509 cert")?;
+
+    let x509 = x509builder.build();
+
+    Ok((x509, pkey))
 }
 
-// PeerInfo
-const MAX_PEER_INFO_SIZE: usize = 1 << 13;
-const ADB_RSA_PUB_KEY: u8 = 0;
-const ADB_DEVICE_GUID: u8 = 0;
-
-// PairingPacketHeader
-const CURRENT_KEY_HEADER_VERSION: u8 = 1;
-const MIN_SUPPORTED_KEY_HEADER_VERSION: u8 = 1;
-const MAX_SUPPORTED_KEY_HEADER_VERSION: u8 = 1;
-const MAX_PAYLOAD_SIZE: usize = 2 * MAX_PEER_INFO_SIZE;
-const PAIRING_PACKET_HEADER_SIZE: u8 = 6;
-const SPAKE2_MSG: u8 = 0;
-const PEER_INFO: u8 = 1;
-
-struct PairingPacketHeader {
-    packet_version: u8,
-    packet_type: u8,
-    packet_payload_size: i32,
+fn vec_to_hex(bytes: &Vec<u8>) -> String {
+    bytes.iter().map(|&data| format!("{:02x}", data)).collect()
 }
 
-struct PeerInfo {
-    peer_type: u8,
-    peer_data: Vec<u8>,
-}
-
-fn big_endian_to_little_endian_padded(len: usize, in_val: &BigUint) -> Option<Vec<u8>> {
+fn big_endian_to_little_endian_padded(len: usize, num: boring::bn::BigNum) -> Result<Vec<u8>, anyhow::Error> {
     let mut out = vec![0u8; len];
-    let bytes = in_val.to_bytes_be();
-    let num_bytes = bytes.len();
+    let bytes = swap_endianness(num.to_vec());
+    let mut num_bytes = bytes.len();
     if len < num_bytes {
-        if !fits_in_bytes(&bytes, num_bytes, len) {
-            return None;
+        if !fit_in_bytes(bytes.as_ref(), num_bytes, len) {
+            return Err(anyhow!("Can't fit in bytes"));
         }
+        num_bytes = len;
     }
-    let num_bytes = std::cmp::min(num_bytes, len);
-    out[0..num_bytes].copy_from_slice(&bytes[0..num_bytes]);
-    Some(out)
+    out[..num_bytes].copy_from_slice(&bytes[..num_bytes]);
+    return Ok(out);
 }
 
-fn fits_in_bytes(bytes: &[u8], num_bytes: usize, len: usize) -> bool {
+fn fit_in_bytes(bytes: &Vec<u8>, num_bytes: usize, len: usize) -> bool {
     let mut mask = 0u8;
     for i in len..num_bytes {
         mask |= bytes[i];
     }
-    mask == 0u8
+    return mask == 0;
 }
 
-async fn adb_pairing(ip: &str, port: u16, password: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut rng = rand::thread_rng();
+fn swap_endianness(bytes: Vec<u8>) -> Vec<u8> {
+    bytes.into_iter().rev().collect()
+}
 
-    let bits = 2048;
-    let private_key = RsaPrivateKey::new(&mut rng, bits).expect("failed to generate a key");
+pub fn encode_rsa_publickey(public_key: boring::rsa::Rsa<boring::pkey::Public>) -> Result<Vec<u8>, anyhow::Error> {
+    let mut r32: boring::bn::BigNum;
+    let mut n0inv: boring::bn::BigNum;
+    let mut rr: boring::bn::BigNum;
 
-    let public_key: RsaPublicKey;
-    {
-        let mut cert_param = CertificateParams::new(vec![]);
-        let mut distinguished_name = DistinguishedName::new();
-        distinguished_name.push(DnType::CommonName, "Antagonism");
-        cert_param.distinguished_name = distinguished_name;
-        cert_param.alg = &rcgen::PKCS_RSA_SHA256;
-        let keypair = KeyPair::try_from(private_key.to_pkcs8_der()?.as_bytes())?;
-        cert_param.key_pair = Option::Some(keypair);
-        let rsa_cert = rcgen::Certificate::from_params(cert_param).unwrap();
-        let public_key_pem = rsa_cert.get_key_pair().public_key_pem();
-        public_key = RsaPublicKey::from_public_key_pem(public_key_pem.as_str()).expect("Wrong public key");
+    let mut tmp: boring::bn::BigNum;
+
+    let mut ctx = boring::bn::BigNumContext::new().unwrap();
+
+    if (public_key.n().to_vec().len() as i32) < ANDROID_PUBKEY_MODULUS_SIZE {
+        return Err(anyhow!(String::from("Invalid key length ") + public_key.n().to_vec().len().to_string().as_str()));
     }
 
-    // let public_key = rsa::RsaPublicKey::from_public_key_pem();
+    let mut key_struct = bytebuffer::ByteBuffer::new();
+    key_struct.resize(ANDROID_PUBKEY_ENCODED_SIZE as usize);
+    key_struct.set_endian(bytebuffer::Endian::LittleEndian);
+    key_struct.write_i32(ANDROID_PUBKEY_MODULUS_SIZE_WORDS);
 
-    //println!("Modulus: {}", public_key.n());
-    // Setup TCP TLS connection
-    let client_cert = rcgen::generate_simple_self_signed(vec!["Antagonism".to_string()]).unwrap();
-    let stream = TcpStream::connect((ip, port)).await?;
-    let config = ClientConfig::builder()
-        .with_cipher_suites(&[tokio_rustls::rustls::cipher_suite::TLS13_AES_256_GCM_SHA384])
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS13])
-        .unwrap()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_single_cert(
-            vec![Certificate(client_cert.serialize_der().unwrap())],
-            PrivateKey(client_cert.serialize_private_key_der()),
-        ).expect("Bad cert!");
+    // Compute and store n0inv = -1 / N[0] mod 2 ^ 32
+    r32 = boring::bn::BigNum::new().unwrap();
+    r32.set_bit(32).unwrap();
+    n0inv = public_key.n().to_owned().unwrap();
+    tmp = n0inv.to_owned().unwrap();
+    // do n0inv mod r32
+    n0inv.checked_rem(tmp.as_mut(), r32.as_ref(), ctx.as_mut()).unwrap();
+    tmp = n0inv.to_owned().unwrap();
+    n0inv.mod_inverse(tmp.as_mut(), r32.as_ref(), ctx.as_mut()).unwrap();
+    tmp = n0inv.to_owned().unwrap();
+    n0inv.checked_sub(r32.as_ref(), tmp.as_mut()).unwrap();
+    // This is hacky.....
+    key_struct.write_i32(n0inv.to_dec_str().unwrap().parse::<i32>().unwrap());
 
-    let connector = TlsConnector::from(Arc::new(config));
-    let mut stream = connector.connect(ServerName::try_from(ip).unwrap(), stream).await.expect("Connection error");
+    key_struct.write(big_endian_to_little_endian_padded(
+        ANDROID_PUBKEY_MODULUS_SIZE as usize,
+        public_key.n().to_owned().unwrap())
+        .unwrap().as_slice()).unwrap();
 
-    // Export the paring auth ctx
-    let mut pass_buffer = ByteBuffer::new();
-    {
-        let client_connection = stream.get_mut().1;
-        let mut key_material: [u8; 64] = [0; 64];
-        key_material = client_connection
-            .export_keying_material(key_material, EXPORTED_KEY_LABEL.to_vec().as_slice(), None)?;
-        pass_buffer.resize(password.as_bytes().len() + key_material.len());
-        pass_buffer.write_bytes(password.as_bytes());
-        pass_buffer.write_bytes(&key_material);
-    }
+    rr = boring::bn::BigNum::new().unwrap();
+    rr.set_bit(ANDROID_PUBKEY_MODULUS_SIZE * 8).unwrap();
+    tmp = rr.to_owned().unwrap();
+    rr.mod_sqr(tmp.as_ref(), public_key.n().to_owned().unwrap().as_ref(), ctx.as_mut()).unwrap();
 
-    let (spake25519, mut msg) = Spake2::<Ed25519Group>::start_a(
-        &Password::new(pass_buffer.into_vec()),
-        &Identity::new(CLIENT_NAME.as_ref()),
-        &Identity::new(SERVER_NAME.as_ref()),
-    );
+    key_struct.write(big_endian_to_little_endian_padded(
+        ANDROID_PUBKEY_MODULUS_SIZE as usize,
+        rr.to_owned().unwrap())
+        .unwrap().as_slice()).unwrap();
 
-    // Remove the first byte that indicates the spake2 identity
-    msg.remove(0);
+    println!("{:?}", public_key.e().to_string().parse::<i32>().unwrap());
+    key_struct.write_i32(public_key.e().to_string().parse::<i32>().unwrap());
 
-    let mut packet = PairingPacketHeader {
-        packet_version: CURRENT_KEY_HEADER_VERSION,
-        packet_type: SPAKE2_MSG,
-        packet_payload_size: msg.size() as i32,
-    };
+    Ok(key_struct.into_vec())
+}
 
-    println!("Sent packet payload size: {}", packet.packet_payload_size);
+fn encode_rsa_publickey_with_name(public_key: boring::rsa::Rsa<boring::pkey::Public>) -> Result<Vec<u8>, anyhow::Error> {
+    let name = " Antagonism\u{0}";
+    let pkey_size = 4 * (f64::from(ANDROID_PUBKEY_ENCODED_SIZE) / 3.0).ceil() as usize;
+    let mut bos = bytebuffer::ByteBuffer::new();
+    bos.resize(pkey_size + name.len());
+    let base64 = boring::base64::encode_block(encode_rsa_publickey(public_key).unwrap().as_slice());
+    bos.write(base64.as_bytes()).unwrap();
+    bos.write(name.as_bytes()).unwrap();
+    Ok(bos.into_vec())
+}
 
-    // Write out header
-    {
-        let mut buffer = ByteBuffer::new();
-        buffer.resize(PAIRING_PACKET_HEADER_SIZE as usize);
-        buffer.set_endian(bytebuffer::Endian::BigEndian);
-        buffer.write_bytes(&[packet.packet_version, packet.packet_type]);
-        buffer.write_bytes(&packet.packet_payload_size.to_be_bytes());
-        stream.write(buffer.as_bytes()).await?;
-        stream.write(msg.as_slice()).await?;
-    }
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter()
+        .map(|x| format!("{:02X}", x))
+        .collect::<Vec<_>>()
+        .join("")
+}
 
-    // Read in header
-    {
-        let mut buffer = vec!(0u8; PAIRING_PACKET_HEADER_SIZE as usize);
-        stream.read_exact(buffer.as_mut_slice()).await?;
-        let mut buffer = ByteBuffer::from(buffer);
-        buffer.set_endian(Endian::BigEndian);
+fn test() {
+    let password: [u8; 70] = [
+        0x35, 0x39, 0x32, 0x37, 0x38, 0x31, 0xe6, 0x3d, 0xd9, 0x59, 0x65, 0x1c,
+        0x21, 0x16, 0x00, 0xf3, 0xb6, 0x56, 0x1d, 0x0b, 0x9d, 0x90, 0xaf, 0x09,
+        0xd0, 0xa4, 0xa4, 0x53, 0xee, 0x20, 0x59, 0xa4, 0x80, 0xcc, 0x7c, 0x5a,
+        0x94, 0xd4, 0xd4, 0x89, 0x33, 0xf9, 0xff, 0xf5, 0xfe, 0x43, 0x31, 0x7d,
+        0x52, 0xfa, 0x7b, 0xff, 0x8f, 0x8b, 0xc4, 0xf3, 0x48, 0x8b, 0x80, 0x07,
+        0x33, 0x0f, 0xec, 0x7c, 0x7e, 0xdc, 0x91, 0xc2, 0x0e, 0x5d,
+    ];
+    let spake2_context = boring::curve25519::Spake2Context::new(
+        boring::curve25519::Spake2Role::Alice,
+        CLIENT_NAME,
+        SERVER_NAME,
+    ).unwrap();
+    let mut outbound_msg = vec![0u8; 32];
+    spake2_context.generate_message(outbound_msg.as_mut_slice(), 32, password.as_ref()).unwrap();
+    println!("{:?}", outbound_msg.as_slice());
+    println!("{}", hex::encode_upper(outbound_msg));
+    let stdin = std::io::stdin();
+    let line1 = stdin.lock().lines().next().unwrap().unwrap();
+    let mut bob = hex::decode(line1).unwrap();
+    let mut bob_key = vec![0u8; 64];
+    spake2_context.process_message(bob_key.as_mut_slice(), 64, bob.as_mut_slice()).unwrap();
+    println!("{}", hex::encode_upper(bob_key.clone()));
 
-        let packet_version = buffer.read_u8().unwrap();
-        let packet_type = buffer.read_u8().unwrap();
-        let packet_payload_size = buffer.read_i32().unwrap();
-        if packet_version < MIN_SUPPORTED_KEY_HEADER_VERSION || packet_version > MAX_SUPPORTED_KEY_HEADER_VERSION {
-            println!("PairingPacketHeader version mismatch (us={} them={})", CURRENT_KEY_HEADER_VERSION, packet_version);
-        }
-        if packet_type != SPAKE2_MSG && packet_type != PEER_INFO {
-            println!("Unknown PairingPacket type {}", packet_type);
-        }
-        if packet_payload_size <= 0 || packet_payload_size > MAX_PAYLOAD_SIZE as i32 {
-            println!("Header payload not within a safe payload size (size={})", packet_payload_size);
-        }
-        packet = PairingPacketHeader {
-            packet_version,
-            packet_type,
-            packet_payload_size,
-        }
-    }
+    let mut secret_key = [0u8; 16];
+    hkdf::Hkdf::<sha2::Sha256>::new(None, bob_key.as_ref()).expand("adb pairing_auth aes-128-gcm key".as_bytes(), &mut secret_key).unwrap();
+    println!("secret key: {:?}", boring::base64::encode_block(secret_key.as_slice()));
 
-    if packet.packet_type != SPAKE2_MSG {
-        panic!("Unexpected header type!")
-    }
-    println!("Received packet size: {}", packet.packet_payload_size);
+    let mut decrypt_iv: i64 = 0;
+    let mut encrypt_iv: i64 = 0;
 
-    // Read the SPAKE2 msg payload and initialize the cipher for encrypting the PeerInfo and certificate.
-    let mut their_msg = vec![0u8; (packet.packet_payload_size) as usize];
-    println!("length: {}", their_msg.len());
-    stream.read_exact(their_msg.as_mut_slice()).await?;
-    their_msg.insert(0, 0x42);
-    let key_material = spake25519.finish(their_msg.as_mut_slice()).expect("Spake2 decryption error!");
+    let mut iv_bytes = bytebuffer::ByteBuffer::new();
+    iv_bytes.resize(12);
+    iv_bytes.set_endian(bytebuffer::Endian::LittleEndian);
+    iv_bytes.write_i64(encrypt_iv);
+    encrypt_iv += 1;
 
-    // Start exchanging peer info
-    let peer_info: PeerInfo;
-    {
-        let key_size = 4 * ((ANDROID_PUBKEY_ENCODED_SIZE as f32 / 3.0).ceil() as usize);
+    let iv = iv_bytes.as_bytes();
+    println!("iv: {:?}", boring::base64::encode_block(iv));
 
-        // Prepare the final stream
-        let mut out_stream = ByteBuffer::new();
-        out_stream.resize(key_size + "Antagonism".len() + 2);
+    let mut crypter = boring::symm::Crypter::new(
+        boring::symm::Cipher::aes_128_gcm(),
+        boring::symm::Mode::Encrypt,
+        secret_key.as_ref(),
+        Some(iv)).unwrap();
 
-        if public_key.n().to_bytes_be().len() < ANDROID_PUBKEY_MODULUS_SIZE {
-            panic!("Invalid RSA key length");
-        }
-        let mut key_struct = ByteBuffer::new();
-        key_struct.resize(ANDROID_PUBKEY_ENCODED_SIZE);
-        key_struct.set_endian(Endian::LittleEndian);
-        key_struct.write_i32(ANDROID_PUBKEY_MODULUS_SIZE_WORDS as i32);
-        let mut r32: BigUint = Zero::zero();
-        let mut n0inv: BigUint = Zero::zero();
-        let mut rr: BigUint = Zero::zero();
+    let mut peerinfo = bytebuffer::ByteBuffer::new();
+    peerinfo.resize(MAX_PEER_INFO_SIZE as usize);
+    peerinfo.set_endian(bytebuffer::Endian::BigEndian);
+    peerinfo.write_string("kjsabkabskjnaxslzkbjhmjnkmlkasjbh");
 
-        let public_key_modulus: BigUint = BigUint::from_bytes_be(public_key.n().to_bytes_be().as_slice());
+    let mut encrypted = vec![0u8; peerinfo.len()];
+    crypter.update(peerinfo.as_bytes(), encrypted.as_mut_slice()).unwrap();
+    let fin = crypter.finalize(encrypted.as_mut_slice()).unwrap();
 
-        r32.set_bit(32, true);
-        println!("r32: {:?}", r32);
-        println!("{:?}", public_key_modulus);
-        n0inv = public_key_modulus.modpow(
-            &1.to_biguint().unwrap(), &r32,
-        );
-
-        println!("n0inv before inversemod: {:?}", n0inv);
-        n0inv = n0inv.invm(&r32).unwrap();
-        println!("n0inv after inversemod: {:?}", n0inv);
-        n0inv = r32.sub(n0inv);
-        println!("n0inv after subtraction: {:?}", n0inv);
-        let n0inv = n0inv.to_u32().unwrap();
-        key_struct.write_u32(n0inv);
-
-        // Store the modulus
-        key_struct.write_bytes(big_endian_to_little_endian_padded(ANDROID_PUBKEY_MODULUS_SIZE, &public_key_modulus).unwrap().as_slice());
-
-        // Compute and store rr = (2^(rsa_size)) ^ 2 mod N
-        rr.set_bit((ANDROID_PUBKEY_MODULUS_SIZE * 8) as u64, true);
-        rr = rr.powm(&2.to_biguint().unwrap(), &public_key_modulus);
-        key_struct.write_bytes(big_endian_to_little_endian_padded(ANDROID_PUBKEY_MODULUS_SIZE, &rr).unwrap().as_slice());
-
-        // Store the exponent
-        key_struct.write_i32(public_key.e().to_i32().unwrap());
-        key_struct.as_bytes();
-
-        let base64_encoded = base64::engine::general_purpose::STANDARD.encode(key_struct.as_bytes());
-        println!("{:?}", base64_encoded);
-        out_stream.write_bytes(base64_encoded.as_bytes());
-        out_stream.write_bytes(utils::string_compat::get_bytes(String::from(" Antagonism\u{0000}")).as_ref());
-        let mut peer_data = out_stream.into_vec();
-        peer_data.resize(MAX_PEER_INFO_SIZE - 1, 0);
-
-        peer_info = PeerInfo {
-            peer_type: ADB_RSA_PUB_KEY,
-            peer_data,
-        }
-    }
-
-
-    // Start encrypt / decrypt operations
-    let mut encrypt_iv = 0i64;
-    let mut decrypt_iv = 0i64;
-    {
-        let mut peerInfoBuffer = ByteBuffer::new();
-        peerInfoBuffer.resize(MAX_PEER_INFO_SIZE);
-        peerInfoBuffer.set_endian(Endian::BigEndian);
-        peerInfoBuffer.write_u8(peer_info.peer_type);
-        peerInfoBuffer.write_bytes(peer_info.peer_data.as_slice());
-        // aes_gcm_siv::Key::new_from_slice(&secret_key).expect("GCM Key error");
-
-        let mut secret_key = [0u8; HKDF_KEY_LENGTH];
-        let hkdf = hkdf::Hkdf::<Sha256>::new(None, key_material.as_slice());
-        hkdf.expand(INFO.as_ref(), &mut secret_key).expect("Error in generating hkdf bytes");
-        let aes_key = aes_gcm::Key::<Aes128Gcm>::from_slice(&secret_key);
-        let mut cipher = Aes128Gcm::new(&aes_key);
-
-        let mut iv_buffer = ByteBuffer::new();
-        iv_buffer.resize(GCM_IV_LENGTH);
-        iv_buffer.set_endian(Endian::LittleEndian);
-        iv_buffer.write_i64(encrypt_iv);
-        encrypt_iv += 1;
-
-        let nonce = Nonce::from_slice(iv_buffer.as_bytes());
-        let encrypted_buffer = cipher.encrypt(nonce, peerInfoBuffer.as_bytes()).expect("Encrypt peer info buffer error!");
-
-        packet = PairingPacketHeader {
-            packet_version: CURRENT_KEY_HEADER_VERSION,
-            packet_type: PEER_INFO,
-            packet_payload_size: encrypted_buffer.len() as i32,
-        };
-
-
-        // Write out header
-        // If error will get "Invalid PairingPacketHeader."
-        let mut buffer = ByteBuffer::new();
-        buffer.resize(PAIRING_PACKET_HEADER_SIZE as usize);
-        buffer.set_endian(bytebuffer::Endian::BigEndian);
-        buffer.write_bytes(&[packet.packet_version, packet.packet_type]);
-        buffer.write_bytes(&packet.packet_payload_size.to_be_bytes());
-        stream.write(buffer.as_bytes()).await?;
-        stream.write(encrypted_buffer.as_slice()).await?;
-    }
-
-    Ok(())
+    let mut encryption_tag = vec![0u8; 16];
+    crypter.get_tag(encryption_tag.as_mut_slice()).unwrap();
+    println!("peerinfo: {:?}", hex::encode_upper(peerinfo.as_bytes()));
+    println!("finalized write: {:?}", fin);
+    encrypted.append(encryption_tag.as_mut());
+    println!("encrypted: {:?}", hex::encode_upper(encrypted.as_slice()));
 }
 
 #[tokio::main]
 async fn main() {
-    let ip = "192.168.4.115";
-    let port = 41497;
-    let password = "981859";
+    let host = "192.168.31.169".to_string();
+    let port = "39531".to_string();
+    let code = "487298".to_string();
 
-//    adb_pairing(ip, port, password);
+    // test();
+    // return;
 
-    block_on(async {
-        match adb_pairing(ip, port, password).await {
-            Ok(_) => println!("Pairing successful!"),
-            Err(e) => panic!("Error: {:?}", e),
-        }
-    });
+    // let mut r32 = boring::bn::BigNum::new().unwrap();
+    // r32.set_bit(32).unwrap();
+    // println!("{:?}", r32);
+    // return;
+
+    // Check cert file existance
+    let cert_path = std::path::Path::new("cert.pem");
+    let pkey_path = std::path::Path::new("pkey.pem");
+
+    let x509: Option<boring::x509::X509>;
+    let pkey: Option<boring::pkey::PKey<boring::pkey::Private>>;
+
+    if !cert_path.exists() || !pkey_path.exists() {
+        let (x509_raw, pkey_raw) = generate_cert().unwrap();
+        x509 = Some(x509_raw.clone());
+        pkey = Some(pkey_raw.clone());
+        let mut cert_file = std::fs::File::create(cert_path).unwrap();
+        let mut pkey_file = std::fs::File::create(pkey_path).unwrap();
+        cert_file.write_all(x509_raw.to_pem().unwrap().as_slice()).unwrap();
+        pkey_file.write_all(pkey_raw.private_key_to_pem_pkcs8().unwrap().as_slice()).unwrap();
+    } else {
+        // Load cert and pkey from file
+        let cert_file = std::fs::File::open(cert_path).unwrap();
+        let pkey_file = std::fs::File::open(pkey_path).unwrap();
+        let x509_raw: Vec<u8> = cert_file.bytes().map(|x| x.unwrap()).collect();
+        let x509_raw = x509_raw.as_slice();
+        let pkey_raw: Vec<u8> = pkey_file.bytes().map(|x| x.unwrap()).collect();
+        let pkey_raw = pkey_raw.as_slice();
+
+        x509 = Some(boring::x509::X509::from_pem(x509_raw).unwrap());
+        pkey = Some(boring::pkey::PKey::private_key_from_pem(pkey_raw).unwrap());
+    }
+
+    // x509.unwrap().public_key().unwrap().rsa()
+
+    let domain = host.clone() + ":" + port.as_str();
+    let method = boring::ssl::SslMethod::tls();
+    let mut connector = boring::ssl::SslConnector::builder(method).unwrap();
+    connector.set_verify(boring::ssl::SslVerifyMode::PEER);
+    // The following two line is critical for ADB client auth, without them system_server will throw out "No peer certificate" error.
+    connector.set_certificate(x509.clone().unwrap().as_ref()).unwrap();
+    connector.set_private_key(pkey.clone().unwrap().as_ref()).unwrap();
+
+    let mut config = connector.build().configure().unwrap();
+    config.set_verify_callback(boring::ssl::SslVerifyMode::PEER, |_, _| true);
+    let stream = tokio::net::TcpStream::connect(domain.as_str()).await.unwrap();
+    let mut stream = tokio_boring::connect(config, host.as_str(), stream).await.unwrap();
+    // To ensure the connection is not stolen while we do the PAKE, append the exported key material from the
+    // tls connection to the password.
+    let mut exported_key_material = [0; 64];
+    stream.ssl().export_keying_material(&mut exported_key_material, EXPORTED_KEY_LABEL, None).unwrap();
+    println!("exported_key_material: {:?}", exported_key_material);
+
+    let mut password = vec![0u8; code.as_bytes().len() + exported_key_material.len()];
+    password[..code.as_bytes().len()].copy_from_slice(code.as_bytes());
+    password[code.as_bytes().len()..].copy_from_slice(&exported_key_material);
+    let spake2_context = boring::curve25519::Spake2Context::new(
+        boring::curve25519::Spake2Role::Alice,
+        CLIENT_NAME,
+        SERVER_NAME,
+    ).unwrap();
+    let mut outbound_msg = vec![0u8; 32];
+    spake2_context.generate_message(outbound_msg.as_mut_slice(), 32, password.as_ref()).unwrap();
+
+    // Set header
+    let mut header = bytebuffer::ByteBuffer::new();
+    header.resize(6);
+    header.set_endian(bytebuffer::Endian::BigEndian);
+    // Write in data
+    // Write version
+    header.write_u8(1);
+    // Write message type
+    header.write_u8(0);
+    // Write message length
+    header.write_i32(outbound_msg.len() as i32);
+
+    // Send data
+    stream.write_all(header.as_bytes()).await.unwrap();
+    stream.write_all(outbound_msg.as_slice()).await.unwrap();
+
+    // Read data
+    stream.read_u8().await.unwrap();
+    let msg_type = stream.read_u8().await.unwrap();
+    let payload_length = stream.read_i32().await.unwrap();
+    if msg_type != 0u8 {
+        panic!("Message type miss match")
+    }
+
+    let mut payload_raw = vec![0u8; payload_length as usize];
+    stream.read_exact(payload_raw.as_mut_slice()).await.unwrap();
+
+    let mut bob_key = vec![0u8; 64];
+    spake2_context.process_message(bob_key.as_mut_slice(), 64, payload_raw.as_mut_slice()).unwrap();
+
+    // Has checked the hkdf generation process is correct
+    // TODO: Check if the bob key is the same
+    println!("bob key: {:?}", boring::base64::encode_block(bob_key.as_slice()));
+    let mut secret_key = [0u8; 16];
+    hkdf::Hkdf::<sha2::Sha256>::new(None, bob_key.as_ref()).expand("adb pairing_auth aes-128-gcm key".as_bytes(), &mut secret_key).unwrap();
+    println!("secret key: {:?}", boring::base64::encode_block(secret_key.as_slice()));
+
+    let mut decrypt_iv: i64 = 0;
+    let mut encrypt_iv: i64 = 0;
+
+    let mut iv_bytes = bytebuffer::ByteBuffer::new();
+    iv_bytes.resize(12);
+    iv_bytes.set_endian(bytebuffer::Endian::LittleEndian);
+    iv_bytes.write_i64(encrypt_iv);
+    encrypt_iv += 1;
+
+    let iv = iv_bytes.as_bytes();
+
+    let mut crypter = boring::symm::Crypter::new(
+        boring::symm::Cipher::aes_128_gcm(),
+        boring::symm::Mode::Encrypt,
+        secret_key.as_ref(),
+        Some(iv)).unwrap();
+
+    let mut peerinfo = bytebuffer::ByteBuffer::new();
+    peerinfo.resize(MAX_PEER_INFO_SIZE as usize);
+    peerinfo.set_endian(bytebuffer::Endian::BigEndian);
+
+    peerinfo.write_u8(0);
+    peerinfo.write(encode_rsa_publickey_with_name(x509.unwrap().public_key().unwrap().rsa().unwrap()).unwrap().as_slice()).unwrap();
+
+    let mut encrypted = vec![0u8; peerinfo.as_bytes().len()];
+    crypter.update(peerinfo.as_bytes(), encrypted.as_mut_slice()).unwrap();
+    let fin = crypter.finalize(encrypted.as_mut_slice()).unwrap();
+    if fin != 0 {
+        panic!("Finalize error");
+    }
+
+    let mut encryption_tag = vec![0u8; 16];
+    crypter.get_tag(encryption_tag.as_mut_slice()).unwrap();
+    encrypted.append(encryption_tag.as_mut());
+    // Set header    // Write version
+    let mut header = bytebuffer::ByteBuffer::new();
+    header.resize(6);
+    header.set_endian(bytebuffer::Endian::BigEndian);
+    // Write in data
+    header.write_u8(1);
+    // Write message type
+    header.write_u8(1);
+    // Write message length
+    header.write_i32(encrypted.len() as i32);
+
+    stream.write_all(header.as_bytes()).await.unwrap();
+    stream.write_all(encrypted.as_slice()).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_secs(100)).await;
 }
