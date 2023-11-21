@@ -1,3 +1,5 @@
+mod protocol;
+
 extern crate core;
 
 use anyhow::{anyhow, Context};
@@ -290,11 +292,10 @@ fn test() {
     println!("encrypted: {:?}", hex::encode_upper(encrypted.as_slice()));
 }
 
-#[tokio::main]
-async fn main() {
+async fn pair() {
     let host = "192.168.31.169".to_string();
-    let port = "39531".to_string();
-    let code = "487298".to_string();
+    let port = "45393".to_string();
+    let code = "312501".to_string();
 
     // test();
     // return;
@@ -449,4 +450,10 @@ async fn main() {
     stream.write_all(encrypted.as_slice()).await.unwrap();
 
     tokio::time::sleep(std::time::Duration::from_secs(100)).await;
+}
+
+#[tokio::main]
+async fn main() {
+    //pair().await;
+    protocol::stls_connect().await;
 }
