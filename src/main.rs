@@ -3,8 +3,9 @@ mod protocol;
 extern crate core;
 
 use anyhow::{anyhow, Context};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use clap::{Parser, Subcommand};
 use std::io::{BufRead, Read, Write};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const EXPORTED_KEY_LABEL: &str = "adb-label\u{0}";
 const CLIENT_NAME: &str = "adb pair client\u{0}";
@@ -15,10 +16,14 @@ const ANDROID_PUBKEY_MODULUS_SIZE: i32 = 2048 / 8;
 const ANDROID_PUBKEY_ENCODED_SIZE: i32 = 3 * 4 + 2 * ANDROID_PUBKEY_MODULUS_SIZE;
 const ANDROID_PUBKEY_MODULUS_SIZE_WORDS: i32 = ANDROID_PUBKEY_MODULUS_SIZE / 4;
 
-fn generate_cert() -> anyhow::Result<(boring::x509::X509, boring::pkey::PKey<boring::pkey::Private>)> {
+fn generate_cert() -> anyhow::Result<(
+    boring::x509::X509,
+    boring::pkey::PKey<boring::pkey::Private>,
+)> {
     let rsa = boring::rsa::Rsa::generate(2048).context("failed to generate rsa keypair")?;
     // put it into the pkey struct
-    let pkey = boring::pkey::PKey::from_rsa(rsa).context("failed to create pkey struct from rsa keypair")?;
+    let pkey = boring::pkey::PKey::from_rsa(rsa)
+        .context("failed to create pkey struct from rsa keypair")?;
 
     // make a new x509 certificate with the pkey we generated
     let mut x509builder = boring::x509::X509::builder().context("failed to make x509 builder")?;
@@ -40,7 +45,8 @@ fn generate_cert() -> anyhow::Result<(boring::x509::X509, boring::pkey::PKey<bor
 
     // call fails without expiration dates
     // I guess they are important anyway, but still
-    let not_before = boring::asn1::Asn1Time::days_from_now(0).context("failed to parse 'notBefore' timestamp")?;
+    let not_before = boring::asn1::Asn1Time::days_from_now(0)
+        .context("failed to parse 'notBefore' timestamp")?;
     let not_after = boring::asn1::Asn1Time::days_from_now(360)
         .context("failed to parse 'notAfter' timestamp")?;
     x509builder
@@ -53,7 +59,8 @@ fn generate_cert() -> anyhow::Result<(boring::x509::X509, boring::pkey::PKey<bor
     // add the issuer and subject name
     // it's set to "/CN=LinuxTransport"
     // if we want we can make that configurable later
-    let mut x509namebuilder = boring::x509::X509Name::builder().context("failed to get x509name builder")?;
+    let mut x509namebuilder =
+        boring::x509::X509Name::builder().context("failed to get x509name builder")?;
     x509namebuilder
         .append_entry_by_text("CN", "LinuxTransport")
         .context("failed to append /CN=LinuxTransport to x509name builder")?;
@@ -131,7 +138,10 @@ fn vec_to_hex(bytes: &Vec<u8>) -> String {
     bytes.iter().map(|&data| format!("{:02x}", data)).collect()
 }
 
-fn big_endian_to_little_endian_padded(len: usize, num: boring::bn::BigNum) -> Result<Vec<u8>, anyhow::Error> {
+fn big_endian_to_little_endian_padded(
+    len: usize,
+    num: boring::bn::BigNum,
+) -> Result<Vec<u8>, anyhow::Error> {
     let mut out = vec![0u8; len];
     let bytes = swap_endianness(num.to_vec());
     let mut num_bytes = bytes.len();
@@ -157,7 +167,9 @@ fn swap_endianness(bytes: Vec<u8>) -> Vec<u8> {
     bytes.into_iter().rev().collect()
 }
 
-pub fn encode_rsa_publickey(public_key: boring::rsa::Rsa<boring::pkey::Public>) -> Result<Vec<u8>, anyhow::Error> {
+pub fn encode_rsa_publickey(
+    public_key: boring::rsa::Rsa<boring::pkey::Public>,
+) -> Result<Vec<u8>, anyhow::Error> {
     let mut r32: boring::bn::BigNum;
     let mut n0inv: boring::bn::BigNum;
     let mut rr: boring::bn::BigNum;
@@ -167,7 +179,10 @@ pub fn encode_rsa_publickey(public_key: boring::rsa::Rsa<boring::pkey::Public>) 
     let mut ctx = boring::bn::BigNumContext::new().unwrap();
 
     if (public_key.n().to_vec().len() as i32) < ANDROID_PUBKEY_MODULUS_SIZE {
-        return Err(anyhow!(String::from("Invalid key length ") + public_key.n().to_vec().len().to_string().as_str()));
+        return Err(anyhow!(
+            String::from("Invalid key length ")
+                + public_key.n().to_vec().len().to_string().as_str()
+        ));
     }
 
     let mut key_struct = bytebuffer::ByteBuffer::new();
@@ -181,28 +196,49 @@ pub fn encode_rsa_publickey(public_key: boring::rsa::Rsa<boring::pkey::Public>) 
     n0inv = public_key.n().to_owned().unwrap();
     tmp = n0inv.to_owned().unwrap();
     // do n0inv mod r32
-    n0inv.checked_rem(tmp.as_mut(), r32.as_ref(), ctx.as_mut()).unwrap();
+    n0inv
+        .checked_rem(tmp.as_mut(), r32.as_ref(), ctx.as_mut())
+        .unwrap();
     tmp = n0inv.to_owned().unwrap();
-    n0inv.mod_inverse(tmp.as_mut(), r32.as_ref(), ctx.as_mut()).unwrap();
+    n0inv
+        .mod_inverse(tmp.as_mut(), r32.as_ref(), ctx.as_mut())
+        .unwrap();
     tmp = n0inv.to_owned().unwrap();
     n0inv.checked_sub(r32.as_ref(), tmp.as_mut()).unwrap();
     // This is hacky.....
     key_struct.write_i32(n0inv.to_dec_str().unwrap().parse::<i32>().unwrap());
 
-    key_struct.write(big_endian_to_little_endian_padded(
-        ANDROID_PUBKEY_MODULUS_SIZE as usize,
-        public_key.n().to_owned().unwrap())
-        .unwrap().as_slice()).unwrap();
+    key_struct
+        .write(
+            big_endian_to_little_endian_padded(
+                ANDROID_PUBKEY_MODULUS_SIZE as usize,
+                public_key.n().to_owned().unwrap(),
+            )
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
 
     rr = boring::bn::BigNum::new().unwrap();
     rr.set_bit(ANDROID_PUBKEY_MODULUS_SIZE * 8).unwrap();
     tmp = rr.to_owned().unwrap();
-    rr.mod_sqr(tmp.as_ref(), public_key.n().to_owned().unwrap().as_ref(), ctx.as_mut()).unwrap();
+    rr.mod_sqr(
+        tmp.as_ref(),
+        public_key.n().to_owned().unwrap().as_ref(),
+        ctx.as_mut(),
+    )
+    .unwrap();
 
-    key_struct.write(big_endian_to_little_endian_padded(
-        ANDROID_PUBKEY_MODULUS_SIZE as usize,
-        rr.to_owned().unwrap())
-        .unwrap().as_slice()).unwrap();
+    key_struct
+        .write(
+            big_endian_to_little_endian_padded(
+                ANDROID_PUBKEY_MODULUS_SIZE as usize,
+                rr.to_owned().unwrap(),
+            )
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
 
     println!("{:?}", public_key.e().to_string().parse::<i32>().unwrap());
     key_struct.write_i32(public_key.e().to_string().parse::<i32>().unwrap());
@@ -210,7 +246,9 @@ pub fn encode_rsa_publickey(public_key: boring::rsa::Rsa<boring::pkey::Public>) 
     Ok(key_struct.into_vec())
 }
 
-fn encode_rsa_publickey_with_name(public_key: boring::rsa::Rsa<boring::pkey::Public>) -> Result<Vec<u8>, anyhow::Error> {
+fn encode_rsa_publickey_with_name(
+    public_key: boring::rsa::Rsa<boring::pkey::Public>,
+) -> Result<Vec<u8>, anyhow::Error> {
     let name = " Antagonism\u{0}";
     let pkey_size = 4 * (f64::from(ANDROID_PUBKEY_ENCODED_SIZE) / 3.0).ceil() as usize;
     let mut bos = bytebuffer::ByteBuffer::new();
@@ -222,7 +260,8 @@ fn encode_rsa_publickey_with_name(public_key: boring::rsa::Rsa<boring::pkey::Pub
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .map(|x| format!("{:02X}", x))
         .collect::<Vec<_>>()
         .join("")
@@ -230,32 +269,44 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 fn test() {
     let password: [u8; 70] = [
-        0x35, 0x39, 0x32, 0x37, 0x38, 0x31, 0xe6, 0x3d, 0xd9, 0x59, 0x65, 0x1c,
-        0x21, 0x16, 0x00, 0xf3, 0xb6, 0x56, 0x1d, 0x0b, 0x9d, 0x90, 0xaf, 0x09,
-        0xd0, 0xa4, 0xa4, 0x53, 0xee, 0x20, 0x59, 0xa4, 0x80, 0xcc, 0x7c, 0x5a,
-        0x94, 0xd4, 0xd4, 0x89, 0x33, 0xf9, 0xff, 0xf5, 0xfe, 0x43, 0x31, 0x7d,
-        0x52, 0xfa, 0x7b, 0xff, 0x8f, 0x8b, 0xc4, 0xf3, 0x48, 0x8b, 0x80, 0x07,
+        0x35, 0x39, 0x32, 0x37, 0x38, 0x31, 0xe6, 0x3d, 0xd9, 0x59, 0x65, 0x1c, 0x21, 0x16, 0x00,
+        0xf3, 0xb6, 0x56, 0x1d, 0x0b, 0x9d, 0x90, 0xaf, 0x09, 0xd0, 0xa4, 0xa4, 0x53, 0xee, 0x20,
+        0x59, 0xa4, 0x80, 0xcc, 0x7c, 0x5a, 0x94, 0xd4, 0xd4, 0x89, 0x33, 0xf9, 0xff, 0xf5, 0xfe,
+        0x43, 0x31, 0x7d, 0x52, 0xfa, 0x7b, 0xff, 0x8f, 0x8b, 0xc4, 0xf3, 0x48, 0x8b, 0x80, 0x07,
         0x33, 0x0f, 0xec, 0x7c, 0x7e, 0xdc, 0x91, 0xc2, 0x0e, 0x5d,
     ];
     let spake2_context = boring::curve25519::Spake2Context::new(
         boring::curve25519::Spake2Role::Alice,
         CLIENT_NAME,
         SERVER_NAME,
-    ).unwrap();
+    )
+    .unwrap();
     let mut outbound_msg = vec![0u8; 32];
-    spake2_context.generate_message(outbound_msg.as_mut_slice(), 32, password.as_ref()).unwrap();
+    spake2_context
+        .generate_message(outbound_msg.as_mut_slice(), 32, password.as_ref())
+        .unwrap();
     println!("{:?}", outbound_msg.as_slice());
     println!("{}", hex::encode_upper(outbound_msg));
     let stdin = std::io::stdin();
     let line1 = stdin.lock().lines().next().unwrap().unwrap();
     let mut bob = hex::decode(line1).unwrap();
     let mut bob_key = vec![0u8; 64];
-    spake2_context.process_message(bob_key.as_mut_slice(), 64, bob.as_mut_slice()).unwrap();
+    spake2_context
+        .process_message(bob_key.as_mut_slice(), 64, bob.as_mut_slice())
+        .unwrap();
     println!("{}", hex::encode_upper(bob_key.clone()));
 
     let mut secret_key = [0u8; 16];
-    hkdf::Hkdf::<sha2::Sha256>::new(None, bob_key.as_ref()).expand("adb pairing_auth aes-128-gcm key".as_bytes(), &mut secret_key).unwrap();
-    println!("secret key: {:?}", boring::base64::encode_block(secret_key.as_slice()));
+    hkdf::Hkdf::<sha2::Sha256>::new(None, bob_key.as_ref())
+        .expand(
+            "adb pairing_auth aes-128-gcm key".as_bytes(),
+            &mut secret_key,
+        )
+        .unwrap();
+    println!(
+        "secret key: {:?}",
+        boring::base64::encode_block(secret_key.as_slice())
+    );
 
     let mut decrypt_iv: i64 = 0;
     let mut encrypt_iv: i64 = 0;
@@ -273,7 +324,9 @@ fn test() {
         boring::symm::Cipher::aes_128_gcm(),
         boring::symm::Mode::Encrypt,
         secret_key.as_ref(),
-        Some(iv)).unwrap();
+        Some(iv),
+    )
+    .unwrap();
 
     let mut peerinfo = bytebuffer::ByteBuffer::new();
     peerinfo.resize(MAX_PEER_INFO_SIZE as usize);
@@ -281,7 +334,9 @@ fn test() {
     peerinfo.write_string("kjsabkabskjnaxslzkbjhmjnkmlkasjbh");
 
     let mut encrypted = vec![0u8; peerinfo.len()];
-    crypter.update(peerinfo.as_bytes(), encrypted.as_mut_slice()).unwrap();
+    crypter
+        .update(peerinfo.as_bytes(), encrypted.as_mut_slice())
+        .unwrap();
     let fin = crypter.finalize(encrypted.as_mut_slice()).unwrap();
 
     let mut encryption_tag = vec![0u8; 16];
@@ -292,18 +347,10 @@ fn test() {
     println!("encrypted: {:?}", hex::encode_upper(encrypted.as_slice()));
 }
 
-async fn pair() {
-    let host = "192.168.31.169".to_string();
-    let port = "45393".to_string();
-    let code = "312501".to_string();
-
-    // test();
-    // return;
-
-    // let mut r32 = boring::bn::BigNum::new().unwrap();
-    // r32.set_bit(32).unwrap();
-    // println!("{:?}", r32);
-    // return;
+async fn pair(host: String, port: String, code: String) {
+    // let host = "192.168.31.169".to_string();
+    // let port = "45393".to_string();
+    // let code = "312501".to_string();
 
     // Check cert file existance
     let cert_path = std::path::Path::new("cert.pem");
@@ -318,8 +365,12 @@ async fn pair() {
         pkey = Some(pkey_raw.clone());
         let mut cert_file = std::fs::File::create(cert_path).unwrap();
         let mut pkey_file = std::fs::File::create(pkey_path).unwrap();
-        cert_file.write_all(x509_raw.to_pem().unwrap().as_slice()).unwrap();
-        pkey_file.write_all(pkey_raw.private_key_to_pem_pkcs8().unwrap().as_slice()).unwrap();
+        cert_file
+            .write_all(x509_raw.to_pem().unwrap().as_slice())
+            .unwrap();
+        pkey_file
+            .write_all(pkey_raw.private_key_to_pem_pkcs8().unwrap().as_slice())
+            .unwrap();
     } else {
         // Load cert and pkey from file
         let cert_file = std::fs::File::open(cert_path).unwrap();
@@ -340,17 +391,28 @@ async fn pair() {
     let mut connector = boring::ssl::SslConnector::builder(method).unwrap();
     connector.set_verify(boring::ssl::SslVerifyMode::PEER);
     // The following two line is critical for ADB client auth, without them system_server will throw out "No peer certificate" error.
-    connector.set_certificate(x509.clone().unwrap().as_ref()).unwrap();
-    connector.set_private_key(pkey.clone().unwrap().as_ref()).unwrap();
+    connector
+        .set_certificate(x509.clone().unwrap().as_ref())
+        .unwrap();
+    connector
+        .set_private_key(pkey.clone().unwrap().as_ref())
+        .unwrap();
 
     let mut config = connector.build().configure().unwrap();
     config.set_verify_callback(boring::ssl::SslVerifyMode::PEER, |_, _| true);
-    let stream = tokio::net::TcpStream::connect(domain.as_str()).await.unwrap();
-    let mut stream = tokio_boring::connect(config, host.as_str(), stream).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(domain.as_str())
+        .await
+        .unwrap();
+    let mut stream = tokio_boring::connect(config, host.as_str(), stream)
+        .await
+        .unwrap();
     // To ensure the connection is not stolen while we do the PAKE, append the exported key material from the
     // tls connection to the password.
     let mut exported_key_material = [0; 64];
-    stream.ssl().export_keying_material(&mut exported_key_material, EXPORTED_KEY_LABEL, None).unwrap();
+    stream
+        .ssl()
+        .export_keying_material(&mut exported_key_material, EXPORTED_KEY_LABEL, None)
+        .unwrap();
     println!("exported_key_material: {:?}", exported_key_material);
 
     let mut password = vec![0u8; code.as_bytes().len() + exported_key_material.len()];
@@ -360,9 +422,12 @@ async fn pair() {
         boring::curve25519::Spake2Role::Alice,
         CLIENT_NAME,
         SERVER_NAME,
-    ).unwrap();
+    )
+    .unwrap();
     let mut outbound_msg = vec![0u8; 32];
-    spake2_context.generate_message(outbound_msg.as_mut_slice(), 32, password.as_ref()).unwrap();
+    spake2_context
+        .generate_message(outbound_msg.as_mut_slice(), 32, password.as_ref())
+        .unwrap();
 
     // Set header
     let mut header = bytebuffer::ByteBuffer::new();
@@ -392,14 +457,27 @@ async fn pair() {
     stream.read_exact(payload_raw.as_mut_slice()).await.unwrap();
 
     let mut bob_key = vec![0u8; 64];
-    spake2_context.process_message(bob_key.as_mut_slice(), 64, payload_raw.as_mut_slice()).unwrap();
+    spake2_context
+        .process_message(bob_key.as_mut_slice(), 64, payload_raw.as_mut_slice())
+        .unwrap();
 
     // Has checked the hkdf generation process is correct
     // TODO: Check if the bob key is the same
-    println!("bob key: {:?}", boring::base64::encode_block(bob_key.as_slice()));
+    println!(
+        "bob key: {:?}",
+        boring::base64::encode_block(bob_key.as_slice())
+    );
     let mut secret_key = [0u8; 16];
-    hkdf::Hkdf::<sha2::Sha256>::new(None, bob_key.as_ref()).expand("adb pairing_auth aes-128-gcm key".as_bytes(), &mut secret_key).unwrap();
-    println!("secret key: {:?}", boring::base64::encode_block(secret_key.as_slice()));
+    hkdf::Hkdf::<sha2::Sha256>::new(None, bob_key.as_ref())
+        .expand(
+            "adb pairing_auth aes-128-gcm key".as_bytes(),
+            &mut secret_key,
+        )
+        .unwrap();
+    println!(
+        "secret key: {:?}",
+        boring::base64::encode_block(secret_key.as_slice())
+    );
 
     let mut decrypt_iv: i64 = 0;
     let mut encrypt_iv: i64 = 0;
@@ -416,17 +494,27 @@ async fn pair() {
         boring::symm::Cipher::aes_128_gcm(),
         boring::symm::Mode::Encrypt,
         secret_key.as_ref(),
-        Some(iv)).unwrap();
+        Some(iv),
+    )
+    .unwrap();
 
     let mut peerinfo = bytebuffer::ByteBuffer::new();
     peerinfo.resize(MAX_PEER_INFO_SIZE as usize);
     peerinfo.set_endian(bytebuffer::Endian::BigEndian);
 
     peerinfo.write_u8(0);
-    peerinfo.write(encode_rsa_publickey_with_name(x509.unwrap().public_key().unwrap().rsa().unwrap()).unwrap().as_slice()).unwrap();
+    peerinfo
+        .write(
+            encode_rsa_publickey_with_name(x509.unwrap().public_key().unwrap().rsa().unwrap())
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
 
     let mut encrypted = vec![0u8; peerinfo.as_bytes().len()];
-    crypter.update(peerinfo.as_bytes(), encrypted.as_mut_slice()).unwrap();
+    crypter
+        .update(peerinfo.as_bytes(), encrypted.as_mut_slice())
+        .unwrap();
     let fin = crypter.finalize(encrypted.as_mut_slice()).unwrap();
     if fin != 0 {
         panic!("Finalize error");
@@ -452,8 +540,38 @@ async fn pair() {
     tokio::time::sleep(std::time::Duration::from_secs(100)).await;
 }
 
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Pair {
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: i32,
+        #[arg(long)]
+        code: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Some(command) => {
+            match command {
+                Commands::Pair { host, port, code } =>{
+                    pair(host, port.to_string(), code).await
+                }
+            }
+        }
+        None => println!("Please pass a command"),
+    }
     //pair().await;
-    protocol::stls_connect().await;
+    // protocol::stls_connect().await;
 }
